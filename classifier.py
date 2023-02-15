@@ -9,6 +9,12 @@ class Classifier(nn.Module):
         super().__init__()
         self.args = args
         model = None
+        self.drop_nl = 0
+        if args.drop_nl == 1:
+            print("Included Dropout + NL in classifier..")
+            self.dropout = nn.Dropout(p=0.5)
+            self.relu = nn.ReLU()
+            self.drop_nl = 1
 
         # 1) ResNet backbone (up to penultimate layer)
         if not self.use_bottleneck:
@@ -20,7 +26,17 @@ class Classifier(nn.Module):
         else:
             model = models.__dict__[args.arch](pretrained=True)
             model.fc = nn.Linear(model.fc.in_features, args.bottleneck_dim)
-            bn = nn.BatchNorm1d(args.bottleneck_dim)
+            if self.drop_nl == 1:
+                bn = nn.Sequential(
+                    *[
+                        self.dropout,
+                        self.relu,
+                        nn.BatchNorm1d(args.bottleneck_dim),
+                    ]
+                )
+            else:
+                bn = nn.BatchNorm1d(args.bottleneck_dim)
+            # bn = nn.BatchNorm1d(args.bottleneck_dim)
             self.encoder = nn.Sequential(model, bn)
             self._output_dim = args.bottleneck_dim
 
@@ -54,6 +70,17 @@ class Classifier(nn.Module):
         logging.info(
             f"Loaded from {checkpoint_path}; missing params: {msg.missing_keys}"
         )
+
+    def get_bn_params(self):
+        """
+        Get only batchnorm parameters
+        """
+        bn_params = []
+        for name, param in self.encoder.named_parameters():
+            if "bn" in name:
+                bn_params.append(param)
+        bn_params = [param for param in bn_params if param.requires_grad]
+        return bn_params
 
     def get_params(self):
         """

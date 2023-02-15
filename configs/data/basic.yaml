@@ -10,3 +10,8 @@ aug_type: "moco-v2"   # used in TTA contrastive learning
 
 batch_size: 128
 workers: 4
+
+pasta_a: 3.0
+pasta_b: 0.25
+pasta_k: 2.0
+pasta_prob: 1.0

@@ -18,3 +18,8 @@ refine_method: "nearest_neighbors"
 num_neighbors: 10
 queue_size: -1
 epoch_labeling: false
+pl_thresh: 0.0
+use_pl_thresh: false
+ent_min: false
+ent_coeff: 0.0
+bn_only: false

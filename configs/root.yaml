@@ -11,7 +11,7 @@ seed: null
 # Pipeline flag & memo
 train_source: false
 target_algorithm: "ours"
-workdir: ./output
+workdir: /coc/scratch/prithvi/dg_for_da/recognition_sfda/adacontrast
 memo: test
 sub_memo: null
 project: null

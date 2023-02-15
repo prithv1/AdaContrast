@@ -6,3 +6,9 @@ print_freq: 10
 
 # loss
 epsilon: 0.1
+
+# loss function
+loss_fn: smoothed_ce
+gamma: 2
+mmce_wt: 8.0
+mmce_mode: vanilla
