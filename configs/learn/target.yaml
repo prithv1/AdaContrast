@@ -23,3 +23,7 @@ use_pl_thresh: false
 ent_min: false
 ent_coeff: 0.0
 bn_only: false
+use_source_distill: false
+src_ep: -1
+use_focal: false
+focal_gamma: 1.0

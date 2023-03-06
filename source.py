@@ -15,8 +15,8 @@ import wandb
 import utils
 from torch.autograd import Variable
 
-from classifier import Classifier
-from image_list import ImageList
+from classifier import Classifier, ViTClassifier
+from image_list import ImageList, ImageList_WS
 from utils import (
 	adjust_learning_rate,
 	concat_all_gather,
@@ -30,7 +30,10 @@ from utils import (
 	ProgressMeter,
 	MMCE,
 	MMCE_weighted,
+	TV_Dist,
 )
+
+from sam import SAM
 
 from torchmetrics.classification import MulticlassCalibrationError
 
@@ -57,6 +60,21 @@ def get_source_optimizer(model, args):
 				},
 			]
 		)
+	elif args.optim.name == "adamw":
+		optimizer = torch.optim.AdamW(
+			[
+				{
+					"params": backbone_params,
+					"lr": args.optim.lr,
+					"weight_decay": args.optim.weight_decay,
+				},
+				{
+					"params": extra_params,
+					"lr": args.optim.lr * 10,
+					"weight_decay": args.optim.weight_decay,
+				},
+			]
+		)
 	else:
 		raise NotImplementedError(f"{args.optim.name} not implemented.")
 
@@ -69,7 +87,10 @@ def get_source_optimizer(model, args):
 def train_source_domain(args):
 	logging.info(f"Start source training on {args.data.src_domain}...")
 
-	model = Classifier(args.model_src).to("cuda")
+	if "resnet" in args.model_src.arch:
+		model = Classifier(args.model_src).to("cuda")
+	else:
+		model = ViTClassifier(args.model_src).to("cuda")
 	if args.distributed:
 		model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 		model = DistributedDataParallel(
@@ -79,9 +100,13 @@ def train_source_domain(args):
 
 	# transforms
 	pasta_args = None
-	if args.data.aug_type == "pasta":
-		tr_aug_type = "pasta"
+	# if args.data.aug_type == "pasta":
+	if "pasta" in args.data.aug_type:
+		# tr_aug_type = "pasta"
+		tr_aug_type = args.data.aug_type
 		pasta_args = {"a": args.data.pasta_a, "b": args.data.pasta_b, "k": args.data.pasta_k, "prob": args.data.pasta_prob}
+	elif args.data.aug_type == "mask_v1":
+		tr_aug_type = "mask_v1"
 	else:
 		tr_aug_type = "plain"
 	train_transform = get_augmentation(tr_aug_type, pasta_args=pasta_args)
@@ -97,9 +122,14 @@ def train_source_domain(args):
 		label_file = os.path.join(
 			args.data.image_root, f"{args.data.src_domain}_list.txt"
 		)
-		train_dataset = ImageList(
-			args.data.image_root, label_file, transform=train_transform
-		)
+		if args.learn.weak_strong_consistency:
+			train_dataset = ImageList_WS(
+				args.data.image_root, label_file, transform=train_transform
+			)
+		else:
+			train_dataset = ImageList(
+				args.data.image_root, label_file, transform=train_transform
+			)
 		val_dataset = ImageList(
 			args.data.image_root, label_file, transform=val_transform
 		)
@@ -220,14 +250,25 @@ def train_epoch(train_loader, model, optimizer, epoch, args):
 	for i, data in enumerate(train_loader):
 		# if i > 3:
 		# 	break
-		images = data[0].cuda(args.gpu, non_blocking=True)
-		labels = data[1].cuda(args.gpu, non_blocking=True)
+		if args.learn.weak_strong_consistency:
+			images = data[0].cuda(args.gpu, non_blocking=True)
+			images_w = data[1].cuda(args.gpu, non_blocking=True)
+			labels = data[2].cuda(args.gpu, non_blocking=True)	
+		else:
+			images = data[0].cuda(args.gpu, non_blocking=True)
+			labels = data[1].cuda(args.gpu, non_blocking=True)
 
 		# per-step scheduler
 		step = i + epoch * len(train_loader)
 		adjust_learning_rate(optimizer, step, args)
 
-		logits = model(images)
+		# logits = model(images)
+
+		if args.learn.weak_strong_consistency:
+			logits_s = model(images)
+			logits = model(images_w)
+		else:
+			logits = model(images)
 
 		if args.learn.loss_fn == "smoothed_ce":
 			loss_ce = smoothed_cross_entropy(
@@ -256,6 +297,10 @@ def train_epoch(train_loader, model, optimizer, epoch, args):
 			else:
 				mmce_loss = MMCE_weighted()(logits, labels)
 			loss_ce += args.learn.mmce_wt * mmce_loss
+   
+		if args.learn.weak_strong_consistency:
+			loss_ws = ws_consistency_loss(logits_s, logits)
+			loss_ce += args.learn.consis_coeff * loss_ws
 
 		# train acc measure (on one GPU only)
 		preds = logits.argmax(dim=1)
@@ -264,8 +309,11 @@ def train_epoch(train_loader, model, optimizer, epoch, args):
 		top1.update(acc.item(), images.size(0))
 
 		if use_wandb(args):
-			wandb.log({"Loss": loss_ce.item()}, commit=(i != len(train_loader)))
-
+			if args.learn.weak_strong_consistency:
+				wandb.log({"Loss": loss_ce.item(), "(WS) Loss": loss_ws.item()}, commit=(i != len(train_loader)))
+			else:
+	   			wandb.log({"Loss": loss_ce.item()}, commit=(i != len(train_loader)))
+	
 		# perform one gradient step
 		optimizer.zero_grad()
 		loss_ce.backward()
@@ -316,6 +364,8 @@ def evaluate(val_loader, model, domain, args, wandb_commit=True):
 		all_probs = remove_wrap_arounds(all_probs, ranks).cpu()
 
 	accuracy = (all_preds == gt_labels).float().mean() * 100.0
+	er = 1.0 - 0.01*accuracy
+	tv_dist = TV_Dist(all_preds, gt_labels)
 	ent = torch.mean(utils.Entropy(all_probs))
 	nll = nn.NLLLoss()(nn.LogSoftmax(dim=1)(all_logits), gt_labels)
 	bsc = utils.BrierScore()(all_probs, gt_labels)
@@ -324,7 +374,10 @@ def evaluate(val_loader, model, domain, args, wandb_commit=True):
 	mce = MulticlassCalibrationError(num_classes=args.model_src.num_classes, n_bins=n_bins, norm="max")(all_probs, gt_labels)
 	
 	wandb_dict = {f"{domain} Acc": accuracy}
+	wandb_dict[f"{domain} ER"] = er
 	log_str = f"Accuracy: {accuracy:.2f}"
+	log_str += f" ER: {er:.2f}"
+	log_str += f" TV: {tv_dist:.2f}"
 	log_str += f" Ent: {ent:.4f}"
 	log_str += f" NLL: {nll:.4f}"
 	log_str += f" BSC: {bsc:.4f}"
@@ -342,18 +395,28 @@ def evaluate(val_loader, model, domain, args, wandb_commit=True):
 			y_true=gt_labels.numpy(), y_pred=all_preds.numpy()
 		)
 		wandb_dict[f"{domain} Avg"] = acc_per_class.mean()
+		wandb_dict[f"{domain} Avg ER"] = 1.0 - 0.01*acc_per_class.mean()
 		wandb_dict[f"{domain} Per-class"] = acc_per_class
 		wandb_dict[f"{domain} Ent"] = ent
 		wandb_dict[f"{domain} NLL"] = nll
 		wandb_dict[f"{domain} BSC"] = bsc
 		wandb_dict[f"{domain} ECE"] = ece
 		wandb_dict[f"{domain} MCE"] = mce
+		wandb_dict[f"{domain} TV"] = tv_dist
 
 	if use_wandb(args):
 		wandb.log(wandb_dict, commit=wandb_commit)
 
 	return accuracy
 
+def ws_consistency_loss(logits_s, logits_w):
+    log_probs_s = F.log_softmax(logits_s, dim=1)
+    probs_w = F.softmax(logits_w, dim=1)
+    # log_probs_s = F.log_softmax(logits_w, dim=1)
+    # probs_w = F.softmax(logits_s, dim=1)
+    kl_loss = nn.KLDivLoss(reduction="batchmean")
+    loss = kl_loss(log_probs_s, probs_w.detach())
+    return loss
 
 def smoothed_cross_entropy(logits, labels, num_classes, epsilon=0):
 	log_probs = F.log_softmax(logits, dim=1)
@@ -373,6 +436,15 @@ def focal_loss(logits, labels, num_classes, gamma=2):
 	pt = Variable(logpt.data.exp())
 	loss = -1 * (1-pt)**gamma * logpt
 	return loss.mean()
+
+def entropy_minimization(logits):
+	if len(logits) == 0:
+		return torch.tensor([0.0]).cuda()
+	probs = F.softmax(logits, dim=1)
+	ents = -(probs * probs.log()).sum(dim=1)
+
+	loss = ents.mean()
+	return loss
 	
 	
 	

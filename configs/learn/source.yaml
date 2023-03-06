@@ -12,3 +12,5 @@ loss_fn: smoothed_ce
 gamma: 2
 mmce_wt: 8.0
 mmce_mode: vanilla
+weak_strong_consistency: false
+consis_coeff: 0.0

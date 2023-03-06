@@ -22,6 +22,16 @@ LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 NUM_CLASSES = {"domainnet-126": 126, "VISDA-C": 12}
 
+def TV_Dist(all_preds, gt_labels):
+    preds = all_preds.numpy()
+    labels = gt_labels.numpy()
+    _, pred_dist = np.unique(preds, return_counts=True)
+    _, label_dist = np.unique(labels, return_counts=True)
+    pred_dist = pred_dist / pred_dist.sum()
+    label_dist = label_dist / label_dist.sum()
+    tv_dist = 0.5*np.linalg.norm(pred_dist - label_dist, ord=1)
+    return tv_dist
+
 def Entropy(input_):
 	bs = input_.size(0)
 	epsilon = 1e-5
@@ -50,6 +60,52 @@ class BrierScore(nn.Module):
 
 		loss = torch.sum(squared_diff) / float(input.shape[0])
 		return loss
+
+def resize(input,
+		   size=None,
+		   scale_factor=None,
+		   mode='nearest',
+		   align_corners=None,
+		   warning=True):
+	if warning:
+		if size is not None and align_corners:
+			input_h, input_w = tuple(int(x) for x in input.shape[2:])
+			output_h, output_w = tuple(int(x) for x in size)
+			if output_h > input_h or output_w > output_h:
+				if ((output_h > 1 and output_w > 1 and input_h > 1
+					 and input_w > 1) and (output_h - 1) % (input_h - 1)
+						and (output_w - 1) % (input_w - 1)):
+					warnings.warn(
+						f'When align_corners={align_corners}, '
+						'the output would more aligned if '
+						f'input size {(input_h, input_w)} is `x+1` and '
+						f'out size {(output_h, output_w)} is `nx+1`')
+	# print(input.shape)
+	return F.interpolate(input, size, scale_factor, mode, align_corners)
+
+class Masking:
+	def __init__(
+		self,
+		block_size, 
+		ratio,
+		):
+		self.block_size = block_size
+		self.ratio = ratio
+
+	def __call__(self, img):
+		img = transforms.ToTensor()(img)
+  
+		_, H, W = img.shape
+		mshape = 1, 1, round(H / self.block_size), round(W / self.block_size)
+		input_mask = torch.rand(mshape, device=img.device)
+		input_mask = (input_mask > self.ratio).float()
+		# print(input_mask.shape)
+		# print(img.shape)
+		input_mask = resize(input_mask, size=(H, W))
+		# print(input_mask.sum())
+		masked_img = img * input_mask[0]
+		masked_img = transforms.ToPILImage()(masked_img)
+		return masked_img
 
 class PASTA:
 	def __init__(self, alpha: float = 3, beta: float = 0.25, k: int = 2, prob: float = 1.0):
@@ -276,6 +332,17 @@ def get_augmentation(aug_type, normalize=None, pasta_args=None):
 	elif aug_type == "plain":
 		return transforms.Compose(
 			[
+				transforms.Resize((256, 256)),
+				transforms.RandomCrop(224),
+				transforms.RandomHorizontalFlip(),
+				transforms.ToTensor(),
+				normalize,
+			]
+		)
+	elif aug_type == "mask_v1":
+		return transforms.Compose(
+			[
+				Masking(block_size=64, ratio=0.7),
 				transforms.Resize((256, 256)),
 				transforms.RandomCrop(224),
 				transforms.RandomHorizontalFlip(),

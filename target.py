@@ -13,7 +13,7 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 import utils
 
-from classifier import Classifier
+from classifier import Classifier, ViTClassifier
 from image_list import ImageList
 from moco.builder import AdaMoCo
 from moco.loader import NCropsTransform
@@ -31,7 +31,7 @@ from utils import (
 	CustomDistributedDataParallel,
 	ProgressMeter,
 )
-
+from torch.autograd import Variable
 from torchmetrics.classification import MulticlassCalibrationError
 
 @torch.no_grad()
@@ -318,12 +318,27 @@ def train_target_domain(args):
 		args.learn.queue_size = data_length
 		del dummy_dataset
 
-	checkpoint_path = os.path.join(
-		args.model_tta.src_log_dir,
-		f"best_{args.data.src_domain}_{args.seed}.pth.tar",
-	)
-	src_model = Classifier(args.model_src, checkpoint_path)
-	momentum_model = Classifier(args.model_src, checkpoint_path)
+	if args.learn.src_ep == -1:
+		checkpoint_path = os.path.join(
+			args.model_tta.src_log_dir,
+			f"best_{args.data.src_domain}_{args.seed}.pth.tar",
+		)
+	else:
+		checkpoint_path = os.path.join(
+			args.model_tta.src_log_dir,
+			f"intermediate_train_{args.seed}_ep{args.learn.src_ep}.pth.tar"
+		)
+
+	# checkpoint_path = os.path.join(
+	# 	args.model_tta.src_log_dir,
+	# 	f"best_{args.data.src_domain}_{args.seed}.pth.tar",
+	# )
+	if "resnet" in args.model_src.arch: 
+		src_model = Classifier(args.model_src, checkpoint_path)
+		momentum_model = Classifier(args.model_src, checkpoint_path)
+	else:
+		src_model = ViTClassifier(args.model_src, checkpoint_path)
+		momentum_model = ViTClassifier(args.model_src, checkpoint_path)
 	model = AdaMoCo(
 		src_model,
 		momentum_model,
@@ -346,11 +361,28 @@ def train_target_domain(args):
 	val_sampler = (
 		DistributedSampler(val_dataset, shuffle=False) if args.distributed else None
 	)
+	if args.learn.use_source_distill:
+		src_label_file = os.path.join(args.data.image_root, f"{args.data.src_domain}_list.txt")
+		src_dataset = ImageList(
+			image_root=args.data.image_root,
+			label_file=src_label_file,
+			transform=val_transform,
+		)
+		src_sampler = (
+			DistributedSampler(src_dataset, shuffle=False) if args.distributed else None
+		)
+		src_loader = DataLoader(
+			src_dataset, batch_size=256, sampler=src_sampler, num_workers=2
+		)
+	else:
+		src_loader = DataLoader(
+			val_dataset, batch_size=256, sampler=val_sampler, num_workers=2
+		)
 	val_loader = DataLoader(
 		val_dataset, batch_size=256, sampler=val_sampler, num_workers=2
 	)
 	pseudo_item_list, banks = eval_and_label_dataset(
-		val_loader, model, banks=None, args=args
+		src_loader, model, banks=None, args=args
 	)
 	logging.info("2 - Computed initial pseudo labels")
 
@@ -420,7 +452,7 @@ def train_epoch(train_loader, model, banks, optimizer, epoch, args):
 	end = time.time()
 	zero_tensor = torch.tensor([0.0]).to("cuda")
 	for i, data in enumerate(train_loader):
-		# if i > 20:
+		# if i > 100:
 		# 	break
 		# unpack and move data
 		images, img_labels, idxs = data
@@ -537,6 +569,8 @@ def classification_loss(logits_w, logits_s, target_labels, args):
 	if args.learn.ce_sup_type == "weak_weak":
 		if args.learn.use_pl_thresh:
 			loss_cls = subset_cross_entropy_loss(logits_w, target_labels, args)
+		elif args.learn.use_focal:
+			loss_cls = focal_loss(logits_w, target_labels, args)
 		else:
 			loss_cls = cross_entropy_loss(logits_w, target_labels, args)
 		# loss_cls = cross_entropy_loss(logits_w, target_labels, args)
@@ -544,6 +578,8 @@ def classification_loss(logits_w, logits_s, target_labels, args):
 	elif args.learn.ce_sup_type == "weak_strong":
 		if args.learn.use_pl_thresh:
 			loss_cls = subset_cross_entropy_loss(logits_s, target_labels, args)
+		elif args.learn.use_focal:
+			loss_cls = focal_loss(logits_s, target_labels, args)
 		else:
 			loss_cls = cross_entropy_loss(logits_s, target_labels, args)
 		# loss_cls = cross_entropy_loss(logits_s, target_labels, args)
@@ -608,3 +644,15 @@ def entropy_minimization(logits):
 
 	loss = ents.mean()
 	return loss
+
+def focal_loss(logits, labels, args):
+	gamma = args.learn.focal_gamma
+	num_classes = args.model_src.num_classes
+	with torch.no_grad():
+		labels = labels.view(-1,1)
+	logpt = F.log_softmax(logits, dim=1)
+	logpt = logpt.gather(1,labels)
+	logpt = logpt.view(-1)
+	pt = Variable(logpt.data.exp())
+	loss = -1 * (1-pt)**gamma * logpt
+	return loss.mean()
